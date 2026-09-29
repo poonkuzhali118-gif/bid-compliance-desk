@@ -1,0 +1,897 @@
+import { useEffect, useMemo, useState } from 'react';
+
+const CH = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const LOW = 0.75;
+const ORDER = { fail: 0, review: 1, pass: 2, na: 3, off: 4 };
+const LABEL = { fail: 'Flagged', review: 'Manual check', pass: 'Passed', na: 'Not applicable', off: 'Turned off' };
+const MARK = { fail: '✕', review: '!', pass: '✓', na: '–', off: '–' };
+
+const DOCS = {
+  pan: { title: 'PAN card', rows: [['name', 'Name'], ['pan', 'PAN']] },
+  gst: { title: 'GST registration certificate', rows: [['legalName', 'Legal name'], ['gstin', 'GSTIN'], ['status', 'Status']] },
+  form: { title: 'Bid form', rows: [['name', 'Bidder name'], ['entity', 'Entity type'], ['role', 'Bidding as'], ['claimMSE', 'MSE exemption claimed']] },
+  fin: { title: 'CA turnover certificate', rows: [['fy1', 'Turnover FY 2023-24 (₹ lakh)'], ['fy2', 'Turnover FY 2024-25 (₹ lakh)'], ['fy3', 'Turnover FY 2025-26 (₹ lakh)'], ['udin', 'UDIN'], ['ca', 'Chartered accountant']] },
+  exp: { title: 'Past supply order', rows: [['client', 'Client'], ['value', 'Order value (₹ lakh)'], ['date', 'Order date']] },
+  maf: { title: 'Manufacturer authorization', rows: [['oem', 'Manufacturer'], ['validTill', 'Valid till']] },
+  udyam: { title: 'Udyam registration', rows: [['no', 'Udyam number'], ['category', 'Category']] },
+};
+
+const DATEKEYS = new Set(['date', 'validTill']);
+
+const CLAUSES = [
+  ['4.1', 'Bidder must hold an active GST registration issued against the same PAN as the bidder\'s PAN card.', ['R1', 'R2']],
+  ['4.2', 'The bidder\'s legal name must be identical on the PAN card, GST certificate and bid form.', ['R3']],
+  ['4.3', 'Average annual turnover of the last three financial years must meet the minimum, certified by a chartered accountant with a UDIN.', ['R4']],
+  ['4.4', 'At least one similar supply order of the minimum value, executed within the last three years.', ['R5']],
+  ['4.5', 'Resellers must attach a manufacturer authorization that is valid on the bid opening date.', ['R6']],
+  ['4.6', 'Micro and Small Enterprises may claim the turnover exemption only with a valid Udyam registration.', ['R7']],
+];
+
+function gstChecksum(g14) {
+  let s = 0;
+  for (let i = 0; i < 14; i += 1) {
+    const p = CH.indexOf(g14[i]) * (i % 2 === 0 ? 1 : 2);
+    s += Math.floor(p / 36) + (p % 36);
+  }
+  return CH[(36 - (s % 36)) % 36];
+}
+
+function makeGstin(state, pan, entity) {
+  const g = state + pan + entity + 'Z';
+  return g + gstChecksum(g);
+}
+
+function fmtDate(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  return m ? `${+m[3]} ${MON[+m[2] - 1]} ${m[1]}` : s;
+}
+
+function addDays(iso, n) {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+function addYears(iso, n) {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCFullYear(d.getUTCFullYear() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+function fmtN(n) {
+  return String(Math.round(n * 10) / 10);
+}
+
+function normName(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/\bpvt\b/g, 'private')
+    .replace(/\bltd\b/g, 'limited')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+const cfg = {
+  bidDate: '2026-09-15',
+  minTurnover: 250,
+  minOrder: 50,
+  enabled: { R1: true, R2: true, R3: true, R4: true, R5: true, R6: true, R7: true, X1: true },
+};
+
+const RULES = [
+  {
+    id: 'R1',
+    clause: '4.1',
+    title: 'GST registration',
+    weight: 20,
+    check: () => 'GSTIN format, check character and active status',
+    run(b) {
+      const g = b.docs.gst;
+      const ev = [['gst', 'gstin'], ['gst', 'status']];
+      const fmt = /^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$/.test(g.gstin.v);
+      const ok = fmt && gstChecksum(g.gstin.v.slice(0, 14)) === g.gstin.v[14];
+      if (ok && g.status.v === 'Active') return { status: 'pass', msg: 'GSTIN is valid and the registration is active.', ev };
+      if (low(g.gstin)) return { status: 'review', msg: 'GSTIN was read with low confidence. Compare it with the certificate by eye.', ev };
+      if (!fmt) return { status: 'fail', msg: `GSTIN ${g.gstin.v} is not in the 15-character GSTIN format.`, ev };
+      if (!ok) return { status: 'fail', msg: `GSTIN ${g.gstin.v} fails the check-character test, so it is mistyped or invented.`, ev };
+      return { status: 'fail', msg: `GST registration is ${g.status.v.toLowerCase()}.`, ev };
+    },
+  },
+  {
+    id: 'R2',
+    clause: '4.1',
+    title: 'PAN matches GSTIN',
+    weight: 20,
+    check: () => 'PAN inside the GSTIN equals the PAN card, and entity type fits',
+    run(b) {
+      const pan = b.docs.pan.pan;
+      const g = b.docs.gst.gstin;
+      const ev = [['gst', 'gstin'], ['pan', 'pan']];
+      const emb = g.v.slice(2, 12);
+      if (emb === pan.v) {
+        if (b.docs.form.entity.v === 'Company' && pan.v[3] !== 'C') {
+          return { status: 'fail', msg: `Bidder says it is a company, but the PAN's fourth letter is ${pan.v[3]}, not C.`, ev: [...ev, ['form', 'entity']] };
+        }
+        return { status: 'pass', msg: 'PAN card and GSTIN belong to the same PAN.', ev };
+      }
+      if (low(pan, g)) return { status: 'review', msg: 'PAN or GSTIN was read with low confidence, and the two do not match. Check by eye.', ev };
+      return { status: 'fail', msg: `The PAN inside the GSTIN is ${emb}, but the PAN card shows ${pan.v}.`, ev };
+    },
+  },
+  {
+    id: 'R3',
+    clause: '4.2',
+    title: 'Name is the same on every document',
+    weight: 10,
+    check: () => 'Legal name compared across PAN card, GST certificate and bid form',
+    run(b) {
+      const a = b.docs.pan.name;
+      const c = b.docs.gst.legalName;
+      const d = b.docs.form.name;
+      const ev = [['pan', 'name'], ['gst', 'legalName'], ['form', 'name']];
+      const same = normName(a.v) === normName(c.v) && normName(c.v) === normName(d.v);
+      if (same) return { status: 'pass', msg: 'Name matches on all three documents.', ev };
+      if (low(a, c, d)) return { status: 'review', msg: 'Names differ, and one was read with low confidence. Check by eye.', ev };
+      const diff = normName(a.v) !== normName(c.v)
+        ? `"${a.v}" on the PAN card and "${c.v}" on the GST certificate`
+        : `"${c.v}" on the GST certificate and "${d.v}" on the bid form`;
+      return { status: 'fail', msg: `Names differ: ${diff}.`, ev };
+    },
+  },
+  {
+    id: 'R4',
+    clause: '4.3',
+    title: 'Average turnover',
+    weight: 15,
+    check: () => `Three-year average at least ₹${cfg.minTurnover} lakh, or waived for a valid MSE`,
+    run(b) {
+      const f = b.docs.fin;
+      const v = [f.fy1, f.fy2, f.fy3];
+      const ev = [['fin', 'fy1'], ['fin', 'fy2'], ['fin', 'fy3']];
+      const avg = v.reduce((s, x) => s + Number(x.v), 0) / 3;
+      if (avg >= cfg.minTurnover) return { status: 'pass', msg: `Average turnover ₹${fmtN(avg)} lakh meets the ₹${cfg.minTurnover} lakh minimum.`, ev };
+      if (b.docs.form.claimMSE.v === 'Yes' && udyamOK(b)) {
+        return { status: 'pass', msg: `Average ₹${fmtN(avg)} lakh is below the minimum, waived under the MSE exemption.`, ev: [...ev, ['udyam', 'category']] };
+      }
+      if (low(...v)) {
+        return { status: 'review', msg: `Average comes to ₹${fmtN(avg)} lakh, below the ₹${cfg.minTurnover} lakh minimum, but a figure was read with low confidence. Check the CA certificate.`, ev };
+      }
+      return { status: 'fail', msg: `Average turnover ₹${fmtN(avg)} lakh is below the ₹${cfg.minTurnover} lakh minimum.`, ev };
+    },
+  },
+  {
+    id: 'R5',
+    clause: '4.4',
+    title: 'Similar past order',
+    weight: 10,
+    check: () => `One order of ₹${cfg.minOrder} lakh or more in the last 3 years`,
+    run(b) {
+      const o = b.docs.exp;
+      const ev = [['exp', 'value'], ['exp', 'date']];
+      const minDate = addYears(cfg.bidDate, -3);
+      const val = Number(o.value.v);
+      const d = o.date.v;
+      if (val >= cfg.minOrder && d >= minDate && d <= cfg.bidDate) return { status: 'pass', msg: `Order of ₹${fmtN(val)} lakh on ${fmtDate(d)} qualifies.`, ev };
+      if (low(o.value, o.date)) return { status: 'review', msg: 'Order details were read with low confidence. Check by eye.', ev };
+      if (val < cfg.minOrder) return { status: 'fail', msg: `Order value ₹${fmtN(val)} lakh is below ₹${cfg.minOrder} lakh.`, ev };
+      return { status: 'fail', msg: `Order dated ${fmtDate(d)} is older than 3 years before bid opening.`, ev };
+    },
+  },
+  {
+    id: 'R6',
+    clause: '4.5',
+    title: 'Manufacturer authorization',
+    weight: 15,
+    check: () => 'Resellers need an authorization valid on the bid opening date',
+    run(b) {
+      if (b.docs.form.role.v === 'Manufacturer') return { status: 'na', msg: 'Bidder is the manufacturer. No authorization needed.', ev: [['form', 'role']] };
+      if (!b.docs.maf) return { status: 'fail', msg: 'Bidder is a reseller but attached no manufacturer authorization.', ev: [['form', 'role']] };
+      const m = b.docs.maf;
+      const ev = [['maf', 'oem'], ['maf', 'validTill']];
+      if (m.validTill.v >= cfg.bidDate) return { status: 'pass', msg: `Authorization from ${m.oem.v} is valid until ${fmtDate(m.validTill.v)}.`, ev };
+      return { status: 'fail', msg: `Authorization from ${m.oem.v} expired on ${fmtDate(m.validTill.v)}, before bid opening on ${fmtDate(cfg.bidDate)}.`, ev };
+    },
+  },
+  {
+    id: 'R7',
+    clause: '4.6',
+    title: 'MSE exemption claim',
+    weight: 15,
+    check: () => 'An exemption claim needs a Udyam registration in Micro or Small category',
+    run(b) {
+      const claim = b.docs.form.claimMSE.v === 'Yes';
+      const ev = [['form', 'claimMSE'], ['udyam', 'category']];
+      if (!claim) return { status: 'na', msg: 'No exemption claimed.', ev: [['form', 'claimMSE']] };
+      if (udyamOK(b)) return { status: 'pass', msg: `Exemption is backed by a ${b.docs.udyam.category.v} Udyam registration.`, ev };
+      return { status: 'fail', msg: 'Bidder claims the MSE exemption but attached no valid Udyam registration.', ev };
+    },
+  },
+  {
+    id: 'X1',
+    clause: '',
+    title: 'CA UDIN reused across bids',
+    weight: 15,
+    check: () => 'Integrity check across all bids for this tender',
+    run(b, ctx) {
+      const u = b.docs.fin.udin.v;
+      const o = ctx.udin[u];
+      const ev = [['fin', 'udin']];
+      if (o && o.length) return { status: 'fail', msg: `The same UDIN appears in the bid from ${o.join(', ')}. Check the CA certificates for reuse.`, ev };
+      return { status: 'pass', msg: 'UDIN is not used in any other bid.', ev };
+    },
+  },
+];
+
+function low(...fields) {
+  return fields.some((x) => x && x.c < LOW);
+}
+
+function udyamOK(b) {
+  return !!b.docs.udyam && ['Micro', 'Small'].includes(b.docs.udyam.category.v);
+}
+
+const RULE_TITLE = Object.fromEntries(RULES.map((r) => [r.id, r.title]));
+
+function evaluate(bid, all) {
+  const ctx = { udin: {} };
+  all.forEach((o) => {
+    if (o.id !== bid.id) {
+      const u = o.docs.fin.udin.v;
+      (ctx.udin[u] = ctx.udin[u] || []).push(o.name);
+    }
+  });
+
+  const findings = RULES.map((Ru) => {
+    if (!cfg.enabled[Ru.id]) return { id: Ru.id, title: Ru.title, status: 'off', msg: 'Turned off for this tender.', ev: [], pts: 0 };
+    const o = Ru.run(bid, ctx);
+    const pts = o.status === 'fail' ? Ru.weight : o.status === 'review' ? Ru.weight / 2 : 0;
+    return { id: Ru.id, title: Ru.title, status: o.status, msg: o.msg, ev: o.ev || [], pts };
+  });
+
+  const score = Math.min(100, Math.round(findings.reduce((s, f) => s + f.pts, 0) * 10) / 10);
+  const band = score >= 40 ? 'High' : score >= 15 ? 'Medium' : 'Low';
+  const counts = { fail: 0, review: 0, pass: 0 };
+  findings.forEach((f) => {
+    if (counts[f.status] !== undefined) counts[f.status] += 1;
+  });
+
+  return { findings, score, band, counts };
+}
+
+function F(v, c) {
+  return { v: String(v), c: c == null ? 0.97 : c };
+}
+
+function build(o) {
+  const ct = o.ct || [];
+  return {
+    id: o.id,
+    name: o.name,
+    docs: {
+      pan: { name: F(o.panName || o.name), pan: F(o.pan) },
+      gst: {
+        legalName: F(o.gstName || o.name),
+        gstin: F(o.gstin || makeGstin(o.state, o.gstPan || o.pan, '1')),
+        status: F(o.gstStatus || 'Active'),
+      },
+      form: {
+        name: F(o.name),
+        entity: F(o.entity || 'Company'),
+        role: F(o.role || 'Manufacturer'),
+        claimMSE: F(o.claim || 'No'),
+      },
+      fin: {
+        fy1: F(o.t[0], ct[0]),
+        fy2: F(o.t[1], ct[1]),
+        fy3: F(o.t[2], ct[2]),
+        udin: F(o.udin),
+        ca: F('CA R. Iyer and Associates'),
+      },
+      exp: { client: F(o.client || 'A public sector refinery'), value: F(o.order), date: F(o.orderDate) },
+      maf: o.maf ? { oem: F(o.maf[0]), validTill: F(o.maf[1]) } : null,
+      udyam: o.udyam ? { no: F(o.udyam[0]), category: F(o.udyam[1]) } : null,
+    },
+  };
+}
+
+function badGstin() {
+  const g = makeGstin('36', 'AACCH3376B', '1');
+  return g.slice(0, 14) + (g[14] === '7' ? '8' : '7');
+}
+
+const SAMPLE = [
+  build({ id: 'b1', name: 'Meridian Gauge Works Pvt Ltd', pan: 'AABCM4821K', state: '27', t: [310, 335, 360], udin: '26123456ABCXYZ0001', order: 118, orderDate: '2025-11-20' }),
+  build({ id: 'b2', name: 'Kaveri Precision Tools Pvt Ltd', gstName: 'Kaveri Precision Tool Private Limited', pan: 'AAACK7310M', gstPan: 'AAACK7130M', state: '33', t: [280, 290, 305], udin: '26123456ABCXYZ0777', order: 96, orderDate: '2025-08-04' }),
+  build({ id: 'b3', name: 'Sundaram Flow Systems Pvt Ltd', pan: 'AABCS9052R', state: '29', role: 'Authorized reseller', maf: ['Halden Gauges GmbH', '2026-06-30'], t: [400, 420, 455], udin: '26098877ADEFGH2210', order: 240, orderDate: '2025-03-12' }),
+  build({ id: 'b4', name: 'Orion Instrumentation Co', pan: 'AAFFO6604D', state: '24', entity: 'Partnership firm', claim: 'Yes', t: [150, 180, 210], udin: '26123456ABCXYZ0777', order: 64, orderDate: '2024-12-15' }),
+  build({ id: 'b5', name: 'Helios Valve & Gauge Pvt Ltd', pan: 'AACCH3376B', gstin: badGstin(), t: [260, 24, 300], ct: [0.97, 0.58, 0.97], udin: '26077712ZXCVBN9055', order: 82, orderDate: '2025-06-02' }),
+];
+
+function rngFactory(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const pick = (r, a) => a[Math.floor(r() * a.length)];
+const int = (r, a, b) => a + Math.floor(r() * (b - a + 1));
+const letter = (r) => String.fromCharCode(65 + int(r, 0, 25));
+const digits = (r, n) => Array.from({ length: n }, () => int(r, 0, 9)).join('');
+const FIRST = ['Aster', 'Vantage', 'Coastal', 'Nexa', 'Pioneer', 'Trident', 'Zenith', 'Lotus', 'Sahyadri', 'Ganga', 'Prism', 'Ridge'];
+const SECOND = ['Instruments', 'Gauge Works', 'Flow Systems', 'Precision Tools', 'Controls', 'Valve and Gauge'];
+const STATES = ['27', '29', '33', '07', '24', '36', '19'];
+const OEMS = ['Halden Gauges GmbH', 'Norrvik Instruments AB', 'Precision Dial Works'];
+const ERRS = ['gstin_typo', 'pan_mismatch', 'name_mismatch', 'low_turnover', 'old_experience', 'maf_expired', 'msme_unsupported'];
+
+function genBid(r, id, errs) {
+  const first = pick(r, FIRST);
+  const second = pick(r, SECOND);
+  const name = `${first} ${second} Pvt Ltd`;
+  const pan = letter(r) + letter(r) + letter(r) + 'C' + first[0].toUpperCase() + digits(r, 4) + letter(r);
+  const st = pick(r, STATES);
+  const truth = new Set();
+  const has = (e) => errs.includes(e);
+  const role = has('maf_expired') || r() < 0.35 ? 'Authorized reseller' : 'Manufacturer';
+  let gstPan = pan;
+  let gstName = name;
+  let claim = 'No';
+  let udyam = null;
+  let mult = (has('low_turnover') || has('msme_unsupported')) ? 0.5 + r() * 0.3 : 1.15 + r() * 0.5;
+  if (!errs.length && r() < 0.12) {
+    mult = 0.5 + r() * 0.3;
+    claim = 'Yes';
+    udyam = [`UDYAM-${pick(r, ['MH', 'KA', 'TN', 'DL', 'GJ'])}-${digits(r, 2)}-${digits(r, 7)}`, pick(r, ['Micro', 'Small'])];
+  }
+  if (has('low_turnover')) truth.add('R4');
+  if (has('msme_unsupported')) {
+    claim = 'Yes';
+    truth.add('R4');
+    truth.add('R7');
+  }
+  if (has('pan_mismatch')) {
+    gstPan = pan.slice(0, 5) + ((+pan[5] + 3) % 10) + pan.slice(6);
+    truth.add('R2');
+  }
+  if (has('name_mismatch')) {
+    gstName = `${first} ${second} LLP`;
+    truth.add('R3');
+  }
+  let gstin = makeGstin(st, gstPan, '1');
+  if (has('gstin_typo')) {
+    gstin = gstin.slice(0, 14) + CH[(CH.indexOf(gstin[14]) + int(r, 1, 34)) % 36];
+    truth.add('R1');
+  }
+  const t = [0, 1, 2].map(() => String(Math.round(cfg.minTurnover * mult * (0.9 + r() * 0.2))));
+  let orderDate = addDays(cfg.bidDate, -int(r, 60, 900));
+  if (has('old_experience')) {
+    orderDate = addDays(cfg.bidDate, -int(r, 1300, 1800));
+    truth.add('R5');
+  }
+  let maf = null;
+  if (role !== 'Manufacturer') {
+    const exp = has('maf_expired');
+    maf = [pick(r, OEMS), exp ? addDays(cfg.bidDate, -int(r, 20, 200)) : addDays(cfg.bidDate, int(r, 60, 400))];
+    if (exp) truth.add('R6');
+  }
+  const bid = build({ id, name, pan, gstPan, gstName, gstin, state: st, role, claim, udyam, maf, t, udin: digits(r, 8) + letter(r) + letter(r) + letter(r) + letter(r) + letter(r) + letter(r) + digits(r, 4), order: Math.round(cfg.minOrder * (1.1 + r() * 2)), orderDate });
+  return { bid, truth };
+}
+
+function corrupt(r, v) {
+  const s = String(v);
+  const i = int(r, 0, s.length - 1);
+  const ch = s[i];
+  let n = ch;
+  if (/\d/.test(ch)) {
+    n = String((+ch + int(r, 1, 9)) % 10);
+  } else if (/[A-Za-z]/.test(ch)) {
+    const base = ch === ch.toUpperCase() ? 65 : 97;
+    n = String.fromCharCode(base + ((ch.charCodeAt(0) - base + int(r, 1, 25)) % 26));
+  }
+  return s.slice(0, i) + n + s.slice(i + 1);
+}
+
+const NOISY = [['pan', 'name'], ['pan', 'pan'], ['gst', 'legalName'], ['gst', 'gstin'], ['form', 'name'], ['fin', 'fy1'], ['fin', 'fy2'], ['fin', 'fy3'], ['fin', 'udin']];
+
+function applyNoise(r, bid) {
+  NOISY.forEach(([d, k]) => {
+    const f = bid.docs[d][k];
+    if (r() < 0.06) {
+      f.v = corrupt(r, f.v);
+      f.c = Math.round((r() < 0.7 ? 0.5 + r() * 0.22 : 0.9 + r() * 0.09) * 100) / 100;
+    } else {
+      f.c = Math.round((0.88 + r() * 0.11) * 100) / 100;
+    }
+  });
+}
+
+function runBench(n, seed) {
+  const r = rngFactory(seed);
+  const items = [];
+  for (let i = 0; i < n; i += 1) {
+    const errs = [];
+    if (r() < 0.6) {
+      errs.push(pick(r, ERRS));
+      if (r() < 0.15) errs.push(pick(r, ERRS));
+    }
+    items.push(genBid(r, `s${i}`, errs));
+  }
+  const idx = items.map((_, i) => i);
+  for (let i = idx.length - 1; i > 0; i -= 1) {
+    const j = int(r, 0, i);
+    [idx[i], idx[j]] = [idx[j], idx[i]];
+  }
+  const pairs = Math.min(Math.floor(n / 2), Math.max(1, Math.round(n * 0.06)));
+  for (let k = 0; k < pairs; k += 1) {
+    const a = items[idx[2 * k]];
+    const b = items[idx[2 * k + 1]];
+    b.bid.docs.fin.udin.v = a.bid.docs.fin.udin.v;
+    a.truth.add('X1');
+    b.truth.add('X1');
+  }
+  items.forEach((it) => applyNoise(r, it.bid));
+  const all = items.map((i) => i.bid);
+  const per = {};
+  RULES.forEach((Ru) => {
+    per[Ru.id] = { id: Ru.id, title: Ru.title, inj: 0, caught: 0, silent: 0, fa: 0 };
+  });
+
+  let flags = 0;
+  let right = 0;
+  let review = 0;
+  let inj = 0;
+  let caught = 0;
+
+  items.forEach((it) => {
+    const e = evaluate(it.bid, all);
+    e.findings.forEach((f) => {
+      if (f.status === 'off') return;
+      const truth = it.truth.has(f.id);
+      const p = per[f.id];
+      if (truth) {
+        inj += 1;
+        p.inj += 1;
+        if (f.status === 'fail' || f.status === 'review') {
+          caught += 1;
+          p.caught += 1;
+        } else {
+          p.silent += 1;
+        }
+      }
+      if (f.status === 'fail') {
+        flags += 1;
+        if (truth) right += 1;
+        else p.fa += 1;
+      }
+      if (f.status === 'review') review += 1;
+    });
+  });
+
+  return {
+    n,
+    seed,
+    inj,
+    caught,
+    flags,
+    right,
+    review,
+    silent: inj - caught,
+    per: Object.values(per).filter((p) => cfg.enabled[p.id]),
+  };
+}
+
+function firstIssue(bid, bids) {
+  const e = evaluate(bid, bids);
+  const f = [...e.findings].sort((a, c) => ORDER[a.status] - ORDER[c.status])[0];
+  return f && (f.status === 'fail' || f.status === 'review') ? f.id : null;
+}
+
+function fieldLabel(docName, key) {
+  const row = DOCS[docName].rows.find((x) => x[0] === key);
+  return row ? row[1] : key;
+}
+
+function fieldValue(value, key) {
+  return DATEKEYS.has(key) ? fmtDate(value) : value;
+}
+
+export default function App() {
+  const [tab, setTab] = useState('bids');
+  const [bids, setBids] = useState([...SAMPLE]);
+  const [selectedBidId, setSelectedBidId] = useState('b1');
+  const [selectedRule, setSelectedRule] = useState(null);
+  const [notes, setNotes] = useState({});
+  const [messages, setMessages] = useState({});
+  const [decisions, setDecisions] = useState({});
+  const [audit, setAudit] = useState([]);
+  const [bench, setBench] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const selectedBid = bids.find((bid) => bid.id === selectedBidId) || bids[0];
+
+  useEffect(() => {
+    if (!selectedBid) return;
+    const next = firstIssue(selectedBid, bids);
+    if (next !== selectedRule) {
+      setSelectedRule(next);
+    }
+  }, [selectedBid, bids]);
+
+  const evalMap = useMemo(
+    () => new Map(bids.map((bid) => [bid.id, evaluate(bid, bids)])),
+    [bids]
+  );
+
+  const currentEval = evalMap.get(selectedBid.id) || { findings: [], score: 0, band: 'Low', counts: { fail: 0, review: 0, pass: 0 } };
+
+  const sortedFindings = useMemo(
+    () => [...currentEval.findings].sort((a, b) => ORDER[a.status] - ORDER[b.status]),
+    [currentEval]
+  );
+
+  const selectedFinding = sortedFindings.find((f) => f.id === selectedRule) || null;
+  const evidenceKeys = new Map((selectedFinding ? selectedFinding.ev : []).map(([docName, field]) => [`${docName}.${field}`, selectedFinding.status]));
+
+  const renderList = () =>
+    bids.map((bid) => {
+      const result = evalMap.get(bid.id);
+      const decision = decisions[bid.id];
+      const on = bid.id === selectedBid.id;
+      return (
+        <li key={bid.id}>
+          <button type="button" className={`bidrow ${on ? 'on' : ''}`} data-action="bid" data-bid={bid.id} aria-current={on ? 'true' : undefined} onClick={() => setSelectedBidId(bid.id)}>
+            <span className="bn">{bid.name}</span>
+            <span className="bm">
+              <span className={`chip band-${result.band}`}>{result.band} risk</span>
+              <span className="bs">{result.score} of 100</span>
+            </span>
+            <span className={`dpill ${decision ? '' : 'none'}`}>{decision ? decision.label : 'Awaiting decision'}</span>
+          </button>
+        </li>
+      );
+    });
+
+  const renderFindings = () =>
+    sortedFindings.map((finding) => {
+      const open = selectedRule === finding.id;
+      const docRows = open && finding.ev.length
+        ? finding.ev
+            .filter(([docName, key]) => selectedBid.docs[docName] && selectedBid.docs[docName][key])
+            .map(([docName, key]) => (
+              <div className="ev-line" key={`${docName}.${key}`}>
+                <span className="ev-doc">{DOCS[docName].title}: {fieldLabel(docName, key)}</span>
+                <span className="ev-val">{fieldValue(selectedBid.docs[docName][key].v, key)}</span>
+              </div>
+            ))
+        : null;
+
+      return (
+        <li key={finding.id} className={`fitem s-${finding.status} ${open ? 'sel' : ''}`}>
+          <button type="button" className="finding" onClick={() => setSelectedRule(open ? null : finding.id)} aria-expanded={open}>
+            <span className="mark" aria-hidden="true">{MARK[finding.status]}</span>
+            <span>
+              <span className="ftitle">{finding.title}</span>
+              <span className="fmsg">{finding.msg}</span>
+            </span>
+            <span className="fmeta">
+              <span className="fstat">{LABEL[finding.status]}</span>
+              {finding.pts ? <span>+{fmtN(finding.pts)} points</span> : null}
+            </span>
+          </button>
+          {open && docRows && docRows.length ? (
+            <div className="evid">
+              {docRows}
+              <button type="button" className="linkbtn" onClick={() => document.querySelector('.line.ev')?.scrollIntoView({ behavior: 'smooth', block: 'center' })}>Show in document</button>
+            </div>
+          ) : null}
+        </li>
+      );
+    });
+
+  const renderDocuments = () =>
+    Object.keys(DOCS).map((key) => {
+      const doc = selectedBid.docs[key];
+      if (!doc) {
+        const need = (key === 'maf' && selectedBid.docs.form.role.v !== 'Manufacturer') || (key === 'udyam' && selectedBid.docs.form.claimMSE.v === 'Yes');
+        return need ? (
+          <article className="doc missing" key={key}>
+            <h3>{DOCS[key].title}</h3>
+            <p>Not submitted.</p>
+          </article>
+        ) : null;
+      }
+
+      return (
+        <article className="doc" key={key}>
+          <h3>{DOCS[key].title}</h3>
+          {DOCS[key].rows.map(([fieldName, label]) => {
+            const field = doc[fieldName];
+            const stateClass = evidenceKeys.get(`${key}.${fieldName}`) ? `ev ev-${evidenceKeys.get(`${key}.${fieldName}`)}` : '';
+            return (
+              <div className={`line ${stateClass}`} data-doc={key} data-key={fieldName} key={`${key}.${fieldName}`}>
+                <span className="k">{label}</span>
+                <span className="v">
+                  {fieldValue(field.v, fieldName)}
+                  {field.c < LOW ? <span className="conf">Read at {Math.round(field.c * 100)}% confidence</span> : null}
+                </span>
+              </div>
+            );
+          })}
+        </article>
+      );
+    });
+
+  const handleDecision = (kind) => {
+    const note = (notes[selectedBid.id] || '').trim();
+
+    if (kind === 'reject' && !note) {
+      setMessages((prev) => ({ ...prev, [selectedBid.id]: 'Add the reason for rejecting this bid.' }));
+      return;
+    }
+
+    if (kind === 'accept' && currentEval.counts.fail > 0 && !note) {
+      setMessages((prev) => ({ ...prev, [selectedBid.id]: 'This bid has flagged findings. Add a note explaining why you are accepting it.' }));
+      return;
+    }
+
+    const label = { accept: 'Accepted', clarify: 'Clarification requested', reject: 'Rejected' }[kind];
+    const ts = new Date().toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+    const nextDecision = { label, note, ts };
+    setDecisions((prev) => ({ ...prev, [selectedBid.id]: nextDecision }));
+    setAudit((prev) => [{ label, bid: selectedBid.name, ts, note, score: currentEval.score, band: currentEval.band, fail: currentEval.counts.fail, review: currentEval.counts.review }, ...prev]);
+    setNotes((prev) => ({ ...prev, [selectedBid.id]: '' }));
+    setMessages((prev) => ({ ...prev, [selectedBid.id]: '' }));
+  };
+
+  const renderBench = () => {
+    const pct = (a, c) => (c ? `${Math.round((a / c) * 100)}%` : 'n/a');
+
+    if (!bench) return null;
+
+    return (
+      <>
+        <div className="stats">
+          <div className="stat"><b>{pct(bench.caught, bench.inj)}</b><span>of {bench.inj} injected errors were caught, flagged or sent to a manual check</span></div>
+          <div className="stat"><b>{pct(bench.right, bench.flags)}</b><span>of {bench.flags} automatic flags were real errors</span></div>
+          <div className="stat"><b>{bench.silent}</b><span>errors passed silently, mostly misread scans that looked confident</span></div>
+          <div className="stat"><b>{bench.review}</b><span>checks were routed to an officer because the scan was unclear</span></div>
+        </div>
+        <div className="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Check</th>
+                <th className="n">Errors injected</th>
+                <th className="n">Caught</th>
+                <th className="n">Missed silently</th>
+                <th className="n">False flags</th>
+              </tr>
+            </thead>
+            <tbody>
+              {bench.per.map((p) => (
+                <tr key={p.id}>
+                  <td>{p.title}</td>
+                  <td className="n">{p.inj}</td>
+                  <td className="n">{p.caught}</td>
+                  <td className="n">{p.silent}</td>
+                  <td className="n">{p.fa}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </>
+    );
+  };
+
+  const addSampleBid = () => {
+    if (busy) return;
+    setBusy(true);
+    setTimeout(() => {
+      const r = rngFactory(Date.now() % 2147483647);
+      const { bid } = genBid(r, `g${Date.now()}`, r() < 0.6 ? [pick(r, ERRS)] : []);
+      applyNoise(r, bid);
+      setBids((prev) => [...prev, bid]);
+      setSelectedBidId(bid.id);
+      setBusy(false);
+    }, 900);
+  };
+
+  const runAccuracyTest = () => {
+    const n = Math.max(10, Math.min(300, Number(document.getElementById('bn')?.value || 40)));
+    const seed = Number(document.getElementById('bs')?.value || 7);
+    setBench(runBench(n, seed));
+  };
+
+  const toggleRule = (id, checked) => {
+    cfg.enabled[id] = checked;
+    setBench(null);
+    setSelectedRule(null);
+  };
+
+  const renderRules = () => {
+    const row = (id) => {
+      const Ru = RULES.find((x) => x.id === id);
+      return (
+        <div className="gen" key={id}>
+          <label className="toggle">
+            <input type="checkbox" data-toggle={id} checked={cfg.enabled[id]} onChange={(event) => toggleRule(id, event.target.checked)} />
+            <span>
+              <span className="rid">{Ru.title}</span> ({Ru.weight} points). {Ru.check()}
+            </span>
+          </label>
+        </div>
+      );
+    };
+
+    return (
+      <>
+        <h2>Tender rules</h2>
+        <p className="lead">Each eligibility clause of the tender becomes one or more checks. Change a value or turn a check off, and every bid is re-checked. In this prototype the clauses are entered by hand. The full product would draft them from the tender document for an officer to confirm.</p>
+        <div className="settings">
+          <div>
+            <label htmlFor="c-date">Bid opening date</label>
+            <input id="c-date" type="date" value={cfg.bidDate} onChange={(event) => { cfg.bidDate = event.target.value; setBench(null); }} />
+          </div>
+          <div>
+            <label htmlFor="c-t">Minimum average turnover (₹ lakh)</label>
+            <input id="c-t" type="number" min="0" value={cfg.minTurnover} onChange={(event) => { cfg.minTurnover = Number(event.target.value) || 0; setBench(null); }} />
+          </div>
+          <div>
+            <label htmlFor="c-o">Minimum single order (₹ lakh)</label>
+            <input id="c-o" type="number" min="0" value={cfg.minOrder} onChange={(event) => { cfg.minOrder = Number(event.target.value) || 0; setBench(null); }} />
+          </div>
+        </div>
+        <ul className="rulelist">
+          {CLAUSES.map(([n, t, ids]) => (
+            <li className="rrow" key={n}>
+              <p className="rid">Clause {n}</p>
+              <p className="clause">{t}</p>
+              {ids.map(row)}
+            </li>
+          ))}
+        </ul>
+        <h3>Integrity check across bids</h3>
+        <ul className="rulelist">
+          <li className="rrow">
+            <p className="clause">Applies to every tender, not a clause of this one.</p>
+            {row('X1')}
+          </li>
+        </ul>
+      </>
+    );
+  };
+
+  const renderAudit = () => {
+    if (!audit.length) {
+      return (
+        <>
+          <h2>Audit log</h2>
+          <p className="empty">No decisions yet. Record a decision on the Bids tab and it will appear here with the risk score and flags at the time.</p>
+        </>
+      );
+    }
+
+    return (
+      <>
+        <h2>Audit log</h2>
+        <p className="lead">Every decision is recorded with the risk picture the officer saw at that moment.</p>
+        <ul className="logs">
+          {audit.map((entry, index) => (
+            <li className="logrow" key={`${entry.ts}-${index}`}>
+              <p><strong>{entry.label}:</strong> {entry.bid}</p>
+              <p className="gen">{entry.ts}. Risk {entry.score} of 100 ({entry.band}), {entry.fail} flagged, {entry.review} manual checks.</p>
+              {entry.note ? <p>Note: {entry.note}</p> : null}
+            </li>
+          ))}
+        </ul>
+      </>
+    );
+  };
+
+  return (
+    <div className="wrap">
+      <header className="top">
+        <h1>Bid Compliance Desk</h1>
+        <p className="tender">Sample tender: 200 industrial pressure gauges, bids opened on <span id="hdrdate">{fmtDate(cfg.bidDate)}</span></p>
+        <p className="proto">Prototype. The sample documents below are already read, and the OCR and GST/MCA lookups are simulated. The rule checks, risk scores, evidence links, decisions and benchmark all run live.</p>
+      </header>
+
+      <nav className="tabs" role="tablist" aria-label="Sections">
+        <button type="button" className="tab" role="tab" aria-selected={tab === 'bids'} onClick={() => setTab('bids')}>Bids</button>
+        <button type="button" className="tab" role="tab" aria-selected={tab === 'rules'} onClick={() => setTab('rules')}>Tender rules</button>
+        <button type="button" className="tab" role="tab" aria-selected={tab === 'bench'} onClick={() => setTab('bench')}>Accuracy test</button>
+        <button type="button" className="tab" role="tab" aria-selected={tab === 'log'} onClick={() => setTab('log')}>Audit log</button>
+      </nav>
+
+      {tab === 'bids' && (
+        <div className="bids">
+          <aside className="list">
+            <div className="list-head">
+              <h2>Bids received</h2>
+              <button type="button" className="btn" onClick={addSampleBid} disabled={busy}>Add sample bid</button>
+            </div>
+            {busy ? <p className="hint" role="status">Reading documents…</p> : null}
+            <ul>{renderList()}</ul>
+          </aside>
+          <div className="mid">
+            <section className="bidhead">
+              <h2>{selectedBid.name}</h2>
+              <p>{selectedBid.docs.form.role.v}, {selectedBid.docs.form.entity.v}</p>
+            </section>
+            <section className="risk">
+              <div className="risk-top">
+                <strong>Risk score {currentEval.score} of 100</strong>
+                <span className={`chip band-${currentEval.band}`}>{currentEval.band} risk</span>
+              </div>
+              <div className="meter" role="img" aria-label={`Risk score ${currentEval.score} out of 100`}>
+                <span className={`fill f-${currentEval.band}`} style={{ width: `${currentEval.score}%` }}></span>
+                <i style={{ left: '15%' }}></i>
+                <i style={{ left: '40%' }}></i>
+              </div>
+              <p className="hint">{currentEval.counts.fail} flagged, {currentEval.counts.review} need a manual check, {currentEval.counts.pass} passed. Low is under 15, high is 40 or more.</p>
+            </section>
+            <section>
+              <h3>Findings</h3>
+              <ul className="flist">{renderFindings()}</ul>
+            </section>
+            <section className="decide">
+              <h3>Officer decision</h3>
+              <label htmlFor="note">Note (required to reject, or to accept a bid with flagged findings)</label>
+              <textarea id="note" rows="2" value={notes[selectedBid.id] || ''} onChange={(event) => setNotes((prev) => ({ ...prev, [selectedBid.id]: event.target.value }))}></textarea>
+              <div className="btns">
+                <button type="button" className="btn primary" onClick={() => handleDecision('accept')}>Accept bid</button>
+                <button type="button" className="btn" onClick={() => handleDecision('clarify')}>Request clarification</button>
+                <button type="button" className="btn danger" onClick={() => handleDecision('reject')}>Reject bid</button>
+              </div>
+              {messages[selectedBid.id] ? <p className="err" role="alert">{messages[selectedBid.id]}</p> : null}
+              {decisions[selectedBid.id] ? (
+                <p className="ok" role="status">
+                  Latest decision: {decisions[selectedBid.id].label} at {decisions[selectedBid.id].ts}.
+                  {decisions[selectedBid.id].note ? ` Note: ${decisions[selectedBid.id].note}` : ''}
+                </p>
+              ) : null}
+            </section>
+          </div>
+          <section className="docs">
+            <h3>Submitted documents</h3>
+            {renderDocuments()}
+          </section>
+        </div>
+      )}
+
+      {tab === 'rules' && <>{renderRules()}</>}
+
+      {tab === 'bench' && (
+        <>
+          <h2>Accuracy test</h2>
+          <p className="lead">The test builds bids with known errors, adds scan noise, runs the same rule engine as the Bids tab, and counts what it catches.</p>
+          <div className="controls">
+            <div>
+              <label htmlFor="bn">Bids to generate</label>
+              <input id="bn" type="number" min="10" max="300" defaultValue={bench ? bench.n : 40} />
+            </div>
+            <div>
+              <label htmlFor="bs">Random seed</label>
+              <input id="bs" type="number" min="1" defaultValue={bench ? bench.seed : 7} />
+            </div>
+            <button type="button" className="btn primary" onClick={runAccuracyTest}>Run test</button>
+          </div>
+          {renderBench()}
+          <p className="caveat">These bids are computer-generated, and 6% of their fields are deliberately misread to imitate scan noise. The test checks the rules and the manual-check routing. It does not measure real OCR quality. Re-run it on real scanned bids before quoting a number to anyone.</p>
+        </>
+      )}
+
+      {tab === 'log' && renderAudit()}
+    </div>
+  );
+}
+
